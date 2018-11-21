@@ -320,8 +320,8 @@ def calc_climatology_window(arr, mstat, cstat):
     cuts = np.arange(0, arr.shape[1], 12).tolist()
     yearly = np.dstack([arr[:, i:i + 12] for i in cuts])
     yearly_stat = mstat(yearly, axis = 1)
-    clim_stat = cstat(yearly_mean, axis = 1)
+    clim_stat = cstat(yearly_stat, axis = 1)
     
     # anything else?
     
-    return(yearly_stat)
+    return(clim_stat)

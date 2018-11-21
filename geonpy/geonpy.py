@@ -282,7 +282,7 @@ def gen_multi_index_slice(year_mon, window, st_year = None, st_mon = None):
     # convert year_mon to an int
     year = year_mon[:, 0]
     mon = year_mon[:, 1]
-    st_slice = (((year-st_year) * 12) + mon) - (st_mon -1)
+    st_slice = (((year-int(st_year)) * 12) + mon) - (int(st_mon) -1)
     
     # output
     z_idx = np.zeros((year_mon.shape[0], window)).astype(int)

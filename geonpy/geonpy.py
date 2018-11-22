@@ -292,6 +292,9 @@ def gen_multi_index_slice(year_mon, window, st_year = None, st_mon = None):
     for i in range(window-1):
         z_idx[:, i] = st_slice-(window-(i+1))
     
+    # set to starting point 0
+    z_idx-= 1
+    
     return(z_idx)
 
 def linidx_take(val_arr,z_indices):

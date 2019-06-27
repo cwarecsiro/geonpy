@@ -1,7 +1,4 @@
 Geonpy
 ======
 
-Use with caution... ::
-
-    >>> import geonpy
-    
+Fast indexing of large spatio-temporal ND arrays for multiple time points.

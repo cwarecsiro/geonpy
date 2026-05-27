@@ -2,7 +2,7 @@
 """
 Geonpy class
 ============
-Provides a way to read in non-contiguous elements (points) from a 3(4?)D array on disk.
+Provides a way to read in non-contiguous elements (points) from a 3D array on disk.
 
 Purpose 
 -------
@@ -11,16 +11,118 @@ This is achieved by reading array element values directly from disk using mumpy 
 
 Limitations
 -----------
-- Other existing file types (e.g. hdf5) might be better suited generally (though array manipulations may not be as straghtforward). 
-- tiffile library can probably achieve this to and may be even better suited.  
+- Other existing file types (e.g. zarr) might be better suited generally (though array manipulations may not be as straghtforward). 
 """
-import struct, rasterio, json, pickle
+import os
+import struct
+import json
+import tempfile
+import urllib.parse
+import urllib.request
+import pickle
+
+import rasterio 
 import numpy as np
 from affine import Affine
 from rasterio.crs import CRS
-import feather
+from rasterio.enums import Resampling
+import xarray as xr
+import rioxarray
+import pyarrow.feather as feather
+import pandas as pd
 
 __version__ = "0.01"
+
+def geometa_path(path):
+    """Return JSON metadata path for an array file path."""
+    base, _ = os.path.splitext(path)
+    return f"{base}.json"
+
+
+def serialize_meta(meta):
+    """Convert metadata into JSON-serializable types."""
+    serialized = {}
+    for key, value in meta.items():
+        if isinstance(value, Affine):
+            serialized[key] = list(value)
+        elif isinstance(value, CRS):
+            serialized[key] = value.to_string()
+        elif isinstance(value, np.dtype):
+            serialized[key] = value.name
+        elif isinstance(value, np.generic):
+            serialized[key] = value.item()
+        else:
+            serialized[key] = value
+    return serialized
+
+
+def deserialize_meta(meta):
+    """Convert JSON metadata fields back to runtime geospatial types."""
+    out = meta.copy()
+
+    if 'transform' in out and isinstance(out['transform'], (list, tuple)):
+        out['transform'] = Affine(*out['transform'])
+
+    if 'dtype' in out:
+        out['dtype'] = np.dtype(out['dtype'])
+
+    if 'crs' in out and out['crs'] is not None and not isinstance(out['crs'], CRS):
+        out['crs'] = CRS.from_user_input(out['crs'])
+
+    return out
+
+
+def write_meta_json(path, meta):
+    """Write metadata as JSON."""
+    with open(path, 'w', encoding='utf-8') as output:
+        json.dump(serialize_meta(meta), output, indent=2)
+
+
+def read_meta_json(path):
+    """Read metadata from JSON and restore runtime types."""
+    with open(path, 'r', encoding='utf-8') as gm:
+        return deserialize_meta(json.load(gm))
+
+class CRSProxy:
+    """Stand-in for rasterio.crs.CRS during unpickling of old-format files."""
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            data = state.get("data", state)
+            if "init" in data:
+                self._crs = CRS.from_user_input(data["init"])
+                return
+            if "wkt" in data:
+                self._crs = CRS.from_wkt(data["wkt"])
+                return
+        # Assume WKT string (modern format)
+        self._crs = CRS.from_wkt(state)
+
+    def to_crs(self):
+        return self._crs
+
+class LegacyCRSUnpickler(pickle.Unpickler):
+    """Unpickler that substitutes CRSProxy for rasterio.crs.CRS."""
+
+    def find_class(self, module, name):
+        if module == "rasterio.crs" and name == "CRS":
+            return CRSProxy
+        return super().find_class(module, name)
+
+
+def is_remote_path(path):
+    """Return True if path is a remote URL."""
+    scheme = urllib.parse.urlparse(path).scheme.lower()
+    return scheme in ("http", "https", "ftp")
+
+
+def download_to_tempfile(url, download_dir = None, suffix = ".nc"):
+    """Download a URL to a temporary file and return local path."""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=download_dir) as tmp:
+        tmp_path = tmp.name
+    urllib.request.urlretrieve(url, tmp_path)
+    return tmp_path
+
 
 def load_npy_to_memmap(filename, dtype, shape):
     """Generate a memory map of an array on disk."""
@@ -145,10 +247,9 @@ class Geonpy(object):
             self.bounds = w, s, e, n
        
     def write_meta(self):
-        """Writes a binary metadata file"""
-        dst = '{}.geometa'.format(self.src.split('.')[0])
-        with open(dst, 'wb') as output:
-            pickle.dump(self.meta, output)
+        """Write metadata JSON sidecar file."""
+        dst = geometa_path(self.src)
+        write_meta_json(dst, self.meta)
     
     def read_points(self, pts, dim_idx = None):
         """Read individual points given as coordinates from an array.
@@ -197,9 +298,7 @@ class Geonpy(object):
             
     def write_geonpy(self, dst):
         np.save(self.array, dst)
-        dst = '{}.geometa'.format(self.src.split('.')[0])
-        with open(dst, 'wb') as output:
-            pickle.dump(self.meta, output)     
+        write_meta_json(geometa_path(dst), self.meta)
     
     def read_header(filename):
         with open(filename, 'rb') as fhandle:
@@ -228,17 +327,164 @@ def concat_rasters_to_geonpy(dst, input_filepaths):
     -----
     Reads rasters in a loop, so may not provide great speed, but it's easy on memory.
     """
-    template = sp.Raster(input_filepaths[0])
-    meta = template.meta
-    template = template.read().array
-    h, w, = template.shape
-    d = len(input_filepaths)
+    with rasterio.open(input_filepaths[0]) as src:
+        meta = src.meta
+        template = src.read(1)
+        h, w, = template.shape
+        d = len(input_filepaths)
     
     # create mm
     mm = np.memmap(dst, dtype=template.dtype, mode='w+', shape=(h, w, d))
     for f in range(len(input_filepaths)):
-        mm[:,:,f] = sp.Raster(input_filepaths[f]).read().array
+        with rasterio.open(input_filepaths[f]) as src:
+            mm[:,:,f] = src.read(1)
     del mm
+    
+    print(f"Generated memmap with shape: {h, w, d} at {dst}")
+
+    # format and write meta
+    opts = ['height', 'width', 'dtype', 'transform', 'crs', 'count']
+    sub_meta = meta.copy()
+    sub_meta['count'] = d
+    for key in meta.keys():
+        if key not in opts:
+            del sub_meta[key]
+    write_meta_json(geometa_path(dst), sub_meta)
+
+def concat_netcdf_to_geonpy(
+    dst: str, 
+    input_filepaths: list, 
+    var_name: str,
+    template: str = None,
+    meta: dict = None,
+    dst_dtype: str = "float32",
+    resampling = Resampling.bilinear, 
+    return_time_vals: bool = False,
+    default_dst_crs: str = "EPSG:4326",
+    download_per_file: bool = False,
+    cleanup_downloaded: bool = True,
+    download_dir: str = None
+):
+    """Read netcdfs and sink them to an ND array on disk as a Geonpy thing.
+    
+    Parameters
+    ----------
+    dst: filepath, required.
+        Location to write file to. File extension (.npy) not required.
+    input_filepaths: filepaths (list), required
+        Locations of netcdfs files to concatenate to a Geonpy file.
+    template: str (optional) 
+        Filepath to template raster
+    meta: dict (optional)
+        One of template or meta must be provided. Spatial metadata to define output.
+    download_per_file: bool, optional
+        If True, remote URLs are downloaded one-by-one in the processing loop.
+    cleanup_downloaded: bool, optional
+        If True and download_per_file is enabled, temporary downloaded files are
+        removed after each iteration.
+    download_dir: str, optional
+        Directory for temporary downloads when download_per_file is enabled.
+        
+    Notes
+    -----
+    Reads netcdfs in a loop, so may not provide great speed, but it's easy on memory.
+    """
+
+    if template is not None:
+        with rasterio.open(template) as ref:
+            dst_crs = ref.crs
+            dst_transform = ref.transform
+            dst_height = ref.height
+            dst_width = ref.width
+            dst_nodata = ref.nodata
+            mask = ref.read(1, masked = True).mask
+    else:
+        dst_crs = meta["crs"]
+        dst_transform = meta["dst_transform"]
+        dst_height = meta["dst_height"]
+        dst_width = meta["dst_width"]
+        dst_nodata = meta["dst_nodata"]
+        mask = None
+    
+    if dst_crs is None:
+        dst_crs = default_dst_crs
+
+    d = len(input_filepaths)
+    h = dst_height
+    w = dst_width
+    
+    meta = {}
+    meta.update(
+        crs = dst_crs,
+        transform = dst_transform,
+        height = h,
+        width = w,
+        nodata = dst_nodata,
+        dtype = dst_dtype,
+        count = d
+    )
+    
+    # create mm
+    mm = np.memmap(dst, dtype=dst_dtype, mode='w+', shape=(h, w, d))
+    time_vals = []
+    for idx, src in enumerate(input_filepaths):
+        nc_path = src
+        downloaded = False
+        ds = None
+
+        if download_per_file and is_remote_path(src):
+            nc_path = download_to_tempfile(src, download_dir = download_dir)
+            downloaded = True
+
+        try:
+            ds = xr.open_dataset(nc_path, chunks={})  # lazy
+            da = ds[var_name]
+
+            # Ensure time dimension handling (monthly files often contain 1 timestep)
+            if "time" in da.dims:
+                da = da.isel(time=0)
+                if "time" in ds:
+                    time_vals.append(np.array(ds["time"].values[0]))
+                else:
+                    time_vals.append(np.datetime64("NaT"))
+            else:
+                time_vals.append(np.datetime64("NaT"))
+
+            # Set spatial dims names if needed (common variants: lon/lat, x/y)
+            # Adjust these two lines to your data if necessary:
+            if {"lon", "lat"}.issubset(set(da.dims)):
+                da = da.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=False)
+            elif {"x", "y"}.issubset(set(da.dims)):
+                da = da.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=False)
+
+            # Assign source CRS if missing (very common in NetCDF)
+            # Replace EPSG:4326 with your actual source CRS if different
+            if da.rio.crs is None:
+                da = da.rio.write_crs("EPSG:4326", inplace=False)
+
+            # Reproject directly to target grid in memory
+            da_out = da.rio.reproject(
+                dst_crs=dst_crs,
+                shape=(dst_height, dst_width),
+                transform=dst_transform,
+                resampling=resampling,
+                nodata=dst_nodata
+            )
+
+            arr = da_out.values.astype(dst_dtype, copy=False)
+            if mask is not None:
+                arr[mask] = -9999
+                arr = np.ma.array(arr, mask = mask)
+
+            mm[:,:,idx] = arr
+        finally:
+            if ds is not None:
+                ds.close()
+            if downloaded and cleanup_downloaded and os.path.exists(nc_path):
+                os.remove(nc_path)
+    del mm
+
+    print(f"Generated memmap with shape: {h, w, d} at {dst}")
     
     # format and write meta
     opts = ['height', 'width', 'dtype', 'transform', 'crs', 'count']
@@ -247,9 +493,11 @@ def concat_rasters_to_geonpy(dst, input_filepaths):
     for key in meta.keys():
         if key not in opts:
             del sub_meta[key]
-    dst = '{}.geometa'.format(dst.split('.')[0])
-    with open(dst, 'wb') as output:
-        pickle.dump(sub_meta, output)
+    write_meta_json(geometa_path(dst), sub_meta)
+
+    if return_time_vals:
+        return time_vals
+
 
 def gen_multi_index_slice(year_mon, window, st_year = None, st_mon = None):
     """

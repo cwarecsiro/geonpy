@@ -1,7 +1,7 @@
 from setuptools import setup
 
 def readme():
-    with open('README.rst') as f:
+    with open('README.md') as f:
         return f.read()
 
 setup(name='geonpy',
@@ -16,11 +16,6 @@ setup(name='geonpy',
       #tests_require=['nose'],
       zip_safe=False,
       install_requires=[
-          'rasterio', 'feather-format',
+          'rasterio', 'pyarrow',
       ]
-      #entry_points={
-      #  'console_scripts': [
-      #      'calc = climate_indicies.calc.__main__:main'
-      #  ]
-    #},
 )
